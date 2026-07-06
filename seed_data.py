@@ -118,14 +118,25 @@ def seed():
             )
             db.session.add(event)
 
-        # Older events (1–14 days ago) — should NOT appear in "listening now" after fix
+        # BUG #2 TEST: Events from yesterday (1-24 hours ago)
+        # These should NOT appear in "listening now" but currently do
+        yesterday_songs = [s for s, _ in all_songs[3:6]]
+        for i, song in enumerate(yesterday_songs):
+            event = ListeningEvent(
+                user_id=users[i].id,
+                song_id=song.id,
+                listened_at=now - timedelta(hours=13 + i),  # 13-15 hours ago (yesterday)
+            )
+            db.session.add(event)
+
+        # Older events (2-14 days ago) — should NOT appear in "listening now" after fix
         for i in range(8):
             song = all_songs[i % len(all_songs)][0]
             user = users[i % len(users)]
             event = ListeningEvent(
                 user_id=user.id,
                 song_id=song.id,
-                listened_at=now - timedelta(hours=2 + i * 8),
+                listened_at=now - timedelta(days=2 + i),  # 2+ days ago
             )
             db.session.add(event)
 
