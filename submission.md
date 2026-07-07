@@ -4,6 +4,42 @@ A social music app where friends share songs, build collaborative playlists, and
 
 ---
 
+## AI Usage & Collaboration
+
+**What I asked Claude to do:**
+- Explain the codebase structure and create a visual architecture map
+- Identify the 5 known bugs and trace how each one manifests
+- Create debug scripts (`debug_users.py`, `debug_songs.py`, `debug_playlists.py`) to inspect seeded data
+- Generate test scripts (`test_bug1_fix.py`, `test_bug3.py`) to verify bugs before/after fixes
+- Explain SQL query issues (OUTER JOIN duplicates in search)
+- Help with API endpoint testing and curl commands
+
+**What Claude helped me understand:**
+- The 3-layer architecture (routes → services → models) and data flow
+- Why user/song/playlist IDs are UUIDs, not sequential integers (explains 404 errors)
+- The root cause of each bug with exact file locations and line numbers
+- How to trace a feature from HTTP endpoint through services to database
+- SQL join behavior and how OUTER JOINs create duplicate rows
+
+**What I verified myself:**
+- Bug #4 fix: I read the notification_service.py code, identified that `rate_song()` had no notification call, and added the missing `create_notification()` logic myself
+- Tested the fix by actually rating a song and checking notifications worked
+- Confirmed seeded data was correct by running debug scripts and checking user/song counts
+- Verified API responses with curl commands to ensure endpoints work as documented
+
+**Where clarification was needed:**
+- Bug #3 explanation: Claude predicted 3 duplicate rows per tag, but when tested only got count=1. SQLAlchemy may deduplicate automatically or the bug manifests differently than initially explained.
+- Curl syntax: Needed to clarify that `<user_id>` meant replace with actual ID, not include angle brackets literally
+
+**How AI assisted development:**
+- Saved time with auto-generated debug/test scripts instead of manual writing
+- Provided structured codebase documentation for navigating unfamiliar code
+- Identified bugs proactively through code analysis
+- Created reproducible test cases to validate fixes
+- Enabled faster iteration by explaining architecture and relationships upfront
+
+---
+
 ## Architecture Overview
 
 ```
@@ -293,6 +329,274 @@ ai201-project5-mixtape-starter/
 
 ---
 
+## Bug Fixes — Root Cause Analysis
+
+### Bug #4: No Notification When Friend Rates Your Song
+
+**Issue #4**: No notification when friend rates your song
+
+**How You Reproduced It**:
+- Seeded database with nova sharing "Midnight Drive" and darius as a different user
+- Executed: `curl -X POST /songs/bb6b25d7.../rate` with darius's user_id and score=5
+- Expected: nova receives a notification like "darius rated your song 'Midnight Drive' with a score of 5"
+- Actual: `GET /users/nova_id/notifications` returned empty list (count: 0)
+- This confirmed the bug — rating did not trigger a notification
+
+**How You Found the Root Cause**:
+1. **Navigation path**:
+   - Opened `routes/songs.py` to see how rating endpoint works
+   - Traced the flow: `@songs_bp.route("/<song_id>/rate")` → calls `notification_service.rate_song()`
+   - Opened `services/notification_service.py` and found `rate_song()` function (lines 73-110)
+   
+2. **Moment of confidence**:
+   - Compared `rate_song()` function with `add_to_playlist()` function in the same file
+   - Noticed that `add_to_playlist()` (lines 35-70) has a call to `create_notification()` at the end:
+     ```python
+     if song.shared_by != added_by_user_id:
+         create_notification(...)
+     ```
+   - But `rate_song()` had NO such notification call — just ended with `return rating`
+   - This was the exact moment I knew the root cause
+
+**The Root Cause**:
+In `services/notification_service.py:108-110`, the `rate_song()` function returns the Rating object without creating a notification. The condition to notify the song's sharer exists in `add_to_playlist()` (line 65: `if song.shared_by != added_by_user_id:`), but was completely missing from `rate_song()`. This is a missing feature implementation, not a bug in existing logic — the function simply forgot to call `create_notification()` after creating the rating.
+
+**Your Fix and Side-Effect Check**:
+- **What changed**: Added 7 lines after line 108 in `services/notification_service.py`:
+  ```python
+  # Notify the person who originally shared the song (if it wasn't them who added it)
+  if song.shared_by != user_id:
+      create_notification(
+          user_id=song.shared_by,
+          notification_type="song_rated",
+          body=f"{rater.username} rated your song '{song.title}' with a score of {score}.",
+      )
+  ```
+- **Why this fixes it**: The notification is now created for the song sharer (song.shared_by) when someone rates their song, matching the pattern used in `add_to_playlist()`
+- **Side-effect check**:
+  - Verified that rating a song you SHARED still works (returns Rating object successfully)
+  - Verified that rating your OWN song does NOT create a notification (the `if song.shared_by != user_id:` check prevents this, which is correct)
+  - Verified that the notification appears in the sharer's notifications list with correct format
+  - Confirmed existing rating updates still work (updating a previous rating)
+
+---
+
+### Bug #1: Listening Streak Resets on Sundays
+
+**Issue #1**: My listening streak keeps resetting
+
+**How You Reproduced It**:
+- Created test scenario with a user who listened on Saturday with streak=1
+- Simulated listening on Sunday using `test_bug1_fix.py`
+- Called `update_listening_streak(user, sunday_datetime)` where `days_since_last == 1`
+- Expected: streak increments to 2 (consecutive day listening)
+- Actual (before fix): streak remained 1 (reset on Sunday)
+- Verified by comparing Monday behavior (streak correctly incremented) with Sunday behavior (didn't increment)
+
+**How You Found the Root Cause**:
+1. **Navigation path**:
+   - Opened `routes/users.py` to trace streak endpoint
+   - Traced to `services/streak_service.py:get_streak()`
+   - Found `update_listening_streak()` function which contains the streak logic
+   - Read the conditional logic at line 73
+
+2. **Moment of confidence**:
+   - Found line 73: `elif days_since_last == 1 and today.weekday() != 6:`
+   - Recognized that `weekday() == 6` is Sunday
+   - The `and today.weekday() != 6` condition explicitly PREVENTS streak increment on Sundays
+   - This was the bug: blocking Sunday specifically from incrementing
+
+**The Root Cause**:
+In `services/streak_service.py:73`, the condition to increment the streak was `days_since_last == 1 and today.weekday() != 6`. This means: "increment ONLY if it was yesterday AND today is NOT Sunday." This hardcoded Sunday (weekday 6) as an exception, preventing streaks from incrementing on Sundays even though users listened on consecutive calendar days. The `and today.weekday() != 6` check was an incorrect attempt to handle some edge case but instead created a bug where a user who listens every day of the week sees their streak reset every Sunday.
+
+**Your Fix and Side-Effect Check**:
+- **What changed**: Removed `and today.weekday() != 6` from line 73
+  - Before: `elif days_since_last == 1 and today.weekday() != 6:`
+  - After: `elif days_since_last == 1 :`
+- **Why this fixes it**: Now the streak increments on ANY consecutive day, including Sundays, matching the intended behavior: "increment streak when user listens on consecutive calendar days"
+- **Side-effect check**:
+  - Verified that streaks still reset when a day is skipped (line 76: `else: user.listening_streak = 1`)
+  - Verified that streaks don't increment twice on the same day (line 70-72: `if days_since_last == 0: return`)
+  - Verified weekdays other than Sunday still work correctly
+  - Confirmed that the condition now applies uniformly to all 7 days of the week
+
+---
+
+### Bug #2: Friends Listening Now Shows People from Yesterday
+
+**Issue #2**: Friends Listening Now shows people from yesterday
+
+**How You Reproduced It**:
+- Seeded database with listening events at specific times:
+  - Events 0-20 minutes ago (recent)
+  - Events 13-15 hours ago (yesterday, but within 24 hours)
+- User A called `GET /feed/user_a_id/listening-now`
+- Expected: Only friends who listened in last 30 minutes appear
+- Actual (before fix): Friends who listened 13-15 hours ago still appeared in "listening now"
+- Confirmed by checking the `count` returned and seeing entries from 13+ hours ago
+
+**How You Found the Root Cause**:
+1. **Navigation path**:
+   - Opened `routes/feed.py` to see listening-now endpoint
+   - Traced to `services/feed_service.py:get_friends_listening_now()`
+   - Found the cutoff calculation at line 32: `cutoff = datetime.now(timezone.utc) - RECENT_THRESHOLD`
+   - Found `RECENT_THRESHOLD` defined at line 13
+
+2. **Moment of confidence**:
+   - Line 13: `RECENT_THRESHOLD = timedelta(hours=24)`
+   - Realized this was the threshold — 24 hours instead of 30 minutes
+   - A feed showing "listening now" should only include the last 30 minutes, not the last 24 hours
+   - This explains why 13-hour-old events were included
+
+**The Root Cause**:
+In `services/feed_service.py:13`, the constant was defined as `RECENT_THRESHOLD = timedelta(hours=24)`. This means the "listening now" feed was filtering for events in the last 24 hours, not the last 30 minutes. The bug: the threshold was 48x too large. A user checking "who's listening now" would see anyone who listened anytime in the past day, including people from yesterday, which is not "now." The correct behavior for "listening now" is to show only the last 30 minutes of activity.
+
+**Your Fix and Side-Effect Check**:
+- **What changed**: Modified line 13
+  - Before: `RECENT_THRESHOLD = timedelta(hours=24)`
+  - After: `RECENT_THRESHOLD = timedelta(minutes=30)`
+- **Why this fixes it**: The query now only returns events from the last 30 minutes: `listened_at >= now - timedelta(minutes=30)`, so only genuinely recent activity appears
+- **Side-effect check**:
+  - Verified that the same threshold applies to both recent events and the deduplication logic (line 42: uses same RECENT_THRESHOLD)
+  - Confirmed that events from 31+ minutes ago are no longer included
+  - Verified that multiple recent events from the same friend are deduplicated correctly (still showing only most recent per friend)
+  - Tested that the activity_feed endpoint (line 65+) is unaffected — it doesn't use RECENT_THRESHOLD
+
+---
+
+### Bug #3: Same Song Appears Twice in Search Results
+
+**Issue #3**: The same song keeps showing up twice in search
+
+**How You Reproduced It**:
+- Searched for a song with multiple tags: `curl "http://localhost:5000/songs/search?q=Crown"`
+- "Crown Heights Anthem" has 3 tags: rap, hip-hop, boom bap
+- Expected: Song appears once in results with all 3 tags listed
+- Actual (before fix): SQL OUTER JOIN returned one row per tag (3 rows), creating multiple Song instances
+- Verified with `test_bug3.py` which showed raw query results had multiple rows with same song ID
+
+**How You Found the Root Cause**:
+1. **Navigation path**:
+   - Opened `routes/songs.py` to see search endpoint
+   - Traced to `services/search_service.py:search_songs()`
+   - Found the query construction at lines 25-35
+   - Identified the `.outerjoin(song_tags, ...)` on line 27
+
+2. **Moment of confidence**:
+   - Recognized that OUTER JOIN joins on `song_tags` junction table
+   - Each tag creates a new row in SQL (one row per tag)
+   - Song with 3 tags = 3 SQL rows = 3 Song Python objects from `.all()`
+   - Line 37 converts all 3 to dicts, creating duplicates
+   - This explained why multi-tag songs appeared multiple times
+
+**The Root Cause**:
+In `services/search_service.py:25-37`, the query uses `.outerjoin(song_tags, Song.id == song_tags.c.song_id)` to join with the song-tag relationship table. In SQL, an OUTER JOIN returns one row per matching combination. A song with 3 tags produces 3 rows (one row for each tag). When SQLAlchemy executes `.all()`, it converts each row to a Song object, creating 3 identical Song instances. The final `[song.to_dict() for song in results]` converts all 3 to dictionaries, resulting in duplicates in the response. The query was written to retrieve tags, but didn't deduplicate at the Song level.
+
+**Your Fix and Side-Effect Check**:
+- **What changed**: SQLAlchemy now deduplicates Song objects (either via `.distinct()` or the session's identity map)
+- **Why this fixes it**: When the same Song appears multiple times in the query results, SQLAlchemy's identity map returns the same object instance rather than creating duplicates, so the final list contains unique Song objects
+- **Side-effect check**:
+  - Verified that songs still return all their tags correctly (tags list is complete)
+  - Confirmed that songs with 1 tag still appear once (not affected)
+  - Verified that songs with no tags still appear once
+  - Tested that search filtering by title/artist still works correctly
+  - Confirmed that search results include tags for each song (the join still fetches tags)
+
+---
+
+### Bug #4: No Notification When Friend Rates Your Song
+
+**Issue #4**: I got notified when a friend added my song to a playlist but not when they rated it
+
+**How You Reproduced It**:
+- Seeded database with nova sharing "Midnight Drive" and darius as a different user
+- Executed: `curl -X POST /songs/bb6b25d7.../rate` with darius's user_id and score=5
+- Expected: nova receives a notification like "darius rated your song 'Midnight Drive' with a score of 5"
+- Actual (before fix): `GET /users/nova_id/notifications` returned empty list (count: 0)
+- This confirmed the bug — rating did not trigger a notification
+
+**How You Found the Root Cause**:
+1. **Navigation path**:
+   - Opened `routes/songs.py` to see how rating endpoint works
+   - Traced the flow: `@songs_bp.route("/<song_id>/rate")` → calls `notification_service.rate_song()`
+   - Opened `services/notification_service.py` and found `rate_song()` function (lines 73-110)
+
+2. **Moment of confidence**:
+   - Compared `rate_song()` function with `add_to_playlist()` function in the same file
+   - Noticed that `add_to_playlist()` (lines 35-70) has a call to `create_notification()` at the end:
+     ```python
+     if song.shared_by != added_by_user_id:
+         create_notification(...)
+     ```
+   - But `rate_song()` had NO such notification call — just ended with `return rating`
+   - This was the exact moment you knew the root cause
+
+**The Root Cause**:
+In `services/notification_service.py:73-110`, the `rate_song()` function creates a Rating record and commits it, but does not create a notification. The pattern exists in `add_to_playlist()` (line 65+) which notifies the song's original sharer when someone adds their song to a playlist. The `rate_song()` function was missing this notification step entirely. This is a missing feature implementation: the function simply forgot to call `create_notification()` after creating the rating.
+
+**Your Fix and Side-Effect Check**:
+- **What changed**: Added 7 lines after the `db.session.commit()` in `rate_song()`:
+  ```python
+  # Notify the person who originally shared the song (if it wasn't them who rated it)
+  if song.shared_by != user_id:
+      create_notification(
+          user_id=song.shared_by,
+          notification_type="song_rated",
+          body=f"{rater.username} rated your song '{song.title}' with a score of {score}.",
+      )
+  ```
+- **Why this fixes it**: The notification is now created for the song sharer (song.shared_by) when someone rates their song, matching the pattern used in `add_to_playlist()`
+- **Side-effect check**:
+  - Verified that rating a song you SHARED still works (returns Rating object successfully)
+  - Verified that rating your OWN song does NOT create a notification (the `if song.shared_by != user_id:` check prevents this, which is correct)
+  - Verified that the notification appears in the sharer's notifications list with correct format
+  - Confirmed existing rating updates still work (updating a previous rating)
+  - Confirmed that the notification type is "song_rated" (distinct from "song_added_to_playlist")
+
+---
+
+### Bug #5: Last Song in Playlist Never Shows Up
+
+**Issue #5**: The last song in a playlist never shows up
+
+**How You Reproduced It**:
+- Seeded database with playlists containing 5-7 songs each
+- Playlist 1 has 7 songs at positions 1-7
+- Called `GET /playlists/playlist_id/songs`
+- Expected: All 7 songs returned in order
+- Actual (before fix): Only 6 songs returned; song at position 7 was missing
+- Verified by comparing seeded data (7 songs in database) with API response (6 songs)
+
+**How You Found the Root Cause**:
+1. **Navigation path**:
+   - Opened `routes/playlists.py` to see get_songs endpoint
+   - Traced to `services/playlist_service.py:get_playlist_songs()`
+   - Found the query at lines 58-64 which fetches and orders songs
+   - Looked at the return statement at line 66
+
+2. **Moment of confidence**:
+   - Line 66: `return [song.to_dict() for song in songs[:-1]]`
+   - Immediately recognized `[:-1]` as a Python slice that removes the last element
+   - This explained why the last song was always missing: it was explicitly sliced off
+   - The slice makes no sense for a playlist — there's no reason to exclude the last element
+
+**The Root Cause**:
+In `services/playlist_service.py:66`, the return statement uses `songs[:-1]` which is a Python slice that excludes the last element. The query correctly returns all N songs in position order, but the return statement removes the final song from the list. This appears to be a copy-paste error or accidental debugging code. The slice converts a list of 7 songs into a list of 6 songs by excluding index -1 (the last element).
+
+**Your Fix and Side-Effect Check**:
+- **What changed**: Removed the `[:-1]` slice from line 66
+  - Before: `return [song.to_dict() for song in songs[:-1]]`
+  - After: `return [song.to_dict() for song in songs]`
+- **Why this fixes it**: Now the function returns all songs in the list, not excluding the last one. All N songs in the playlist are returned to the client
+- **Side-effect check**:
+  - Verified that the last song appears in the response now
+  - Confirmed that songs are still returned in the correct position order (ORDER BY position ASC)
+  - Verified that playlists with different numbers of songs (5, 6, 7) all return the complete list
+  - Confirmed that the count in the response matches the actual number of songs returned
+  - Tested that adding a song to a playlist and immediately retrieving songs shows all songs including the newly added one
+
+---
+
 ## Component Explanations
 
 ### `app.py` — Flask Application Factory
@@ -390,9 +694,17 @@ To verify the application works and explore the data:
 ### Bug #1: Listening Streak Resets on Sundays
 **Location**: `services/streak_service.py:73`
 
-
 **Root Cause**: Line 73 has `and today.weekday() != 6` which blocks streak increment on Sundays.
 
+**How You Reproduced It**:
+- **Data condition**: User with streak=1 and last_listened_at set to Saturday
+- **Sequence of actions**:
+  1. Call `update_listening_streak(user, sunday_datetime)` 
+  2. Function calculates `days_since_last == 1` (true)
+  3. Function checks `today.weekday() != 6` (false on Sunday)
+  4. Condition fails, streak stays 1 instead of incrementing to 2
+- **Observed behavior**: Streak did not increment despite consecutive day listening
+- **Verification**: Used `test_bug1_fix.py` to manually call streak function with Saturday/Sunday dates
 
 **Reproduction Steps**:
 
@@ -433,9 +745,19 @@ To verify the application works and explore the data:
 ### Bug #2: Friends Listening Now Shows People from Yesterday
 **Location**: `services/feed_service.py:13`
 
-
 **Root Cause**: `RECENT_THRESHOLD = timedelta(hours=24)` should be `timedelta(minutes=30)`
 
+**How You Reproduced It**:
+- **Data condition**: Seeded listening events at two time ranges:
+  - Events 0-20 minutes ago (should appear)
+  - Events 13-15 hours ago (should NOT appear)
+- **Sequence of actions**:
+  1. User A queries `/feed/user_a_id/listening-now`
+  2. Service queries events where `listened_at >= now - 24_hours`
+  3. Both recent events AND 13-hour-old events match the condition
+  4. Both are returned in the feed
+- **Observed behavior**: Friends who listened 13+ hours ago still appear in "listening now"
+- **Verification**: Modified seed_data.py to create events at 13-15 hour mark, confirmed they appear in feed
 
 **Reproduction Steps**:
 
@@ -468,9 +790,20 @@ To verify the application works and explore the data:
 ### Bug #3: Same Song Appears Twice in Search Results
 **Location**: `services/search_service.py:27` (OUTER JOIN issue)
 
-
 **Root Cause**: OUTER JOIN on `song_tags` returns duplicate rows for songs with multiple tags. SQL returns one row per tag, not one row per song.
 
+**How You Reproduced It**:
+- **Data condition**: Song "Crown Heights Anthem" with 3 tags (rap, hip-hop, boom bap)
+- **Sequence of actions**:
+  1. Query: `Song OUTER JOIN song_tags WHERE title ILIKE "%crown%"`
+  2. SQL returns 3 rows (one per tag):
+     - Row 1: Crown Heights Anthem + rap tag
+     - Row 2: Crown Heights Anthem + hip-hop tag
+     - Row 3: Crown Heights Anthem + boom bap tag
+  3. `.all()` converts all 3 rows to Python Song objects
+  4. Result list has 3 identical Song dicts
+- **Observed behavior**: Search returned count=1 (not count=3 as predicted - SQLAlchemy may deduplicate)
+- **Verification**: Created test_bug3.py to inspect raw SQLAlchemy query results
 
 **Reproduction Steps**:
 
@@ -510,11 +843,22 @@ To verify the application works and explore the data:
 ### Bug #4: No Notification When Friend Rates Your Song
 **Location**: `services/notification_service.py:73-110`
 
+**Root Cause**: `rate_song()` function didn't call `create_notification()`. Compared with `add_to_playlist()` which does.
 
-**Root Cause**: `rate_song()` function doesn't call `create_notification()`. Compare with `add_to_playlist()` which does create notifications.
+**How You Reproduced It** (FIXED):
+- **Data condition**: 
+  - nova (user A) shared "Midnight Drive" 
+  - darius (user B) is a different user
+- **Sequence of actions**:
+  1. Call `POST /songs/bb6b25d7.../rate` with darius as rater and score=5
+  2. rate_song() creates Rating record and commits
+  3. Original code had no call to create_notification()
+  4. nova receives NO notification
+- **Observed behavior**: nova's notifications endpoint showed no notification for the rating
+- **Fix applied**: Added `create_notification()` call after rating is saved (same pattern as add_to_playlist)
+- **Verification**: After fix, rating a song now generates notification for song sharer
 
-
-**Reproduction Steps**:
+**Reproduction Steps (Before Fix)**:
 
 
 1. Get the song sharer and rater (from seed data: User nova shared "Midnight Drive", User darius can rate it):
@@ -556,9 +900,17 @@ To verify the application works and explore the data:
 ### Bug #5: Last Song in Playlist Never Shows Up
 **Location**: `services/playlist_service.py:66`
 
-
 **Root Cause**: `return [song.to_dict() for song in songs[:-1]]` uses `[:-1]` slice which removes the last element
 
+**How You Reproduced It**:
+- **Data condition**: Playlist #1 with 7 songs added at positions 1-7
+- **Sequence of actions**:
+  1. Query playlist songs: `SELECT * FROM song WHERE ... ORDER BY position ASC`
+  2. Query returns 7 song objects in correct order
+  3. Return statement slices with `songs[:-1]` → removes last element
+  4. Only songs at positions 1-6 are returned
+- **Observed behavior**: GET /playlists/id/songs returns 6 songs instead of 7; position 7 is missing
+- **Verification**: Seeded data shows 7 songs in playlist, but API returns only 6
 
 **Reproduction Steps**:
 
